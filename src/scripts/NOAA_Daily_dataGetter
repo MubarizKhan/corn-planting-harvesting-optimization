@@ -1,0 +1,207 @@
+"""
+Robust NOAA CDO downloader for Illinois GHCND stations.
+Handles:
+- 503 Service Unavailable
+- API rate limits
+- Partial year failures
+- Multiple datatype queries (splits per datatype)
+
+Outputs:
+- data/raw/noaa_il_daily_raw.csv
+- data/processed/noaa_il_weekly_agg.csv
+"""
+
+import os
+import time
+import requests
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+# ---------------- CONFIG ---------------- #
+
+NOAA_TOKEN = "ImRkvVoWZZfIyRovfripXzAkOfNhzUol"   # <--- paste token here
+
+DATASET_ID = "GHCND"
+DATATYPES = ["PRCP", "TMAX", "TMIN", "TAVG", "AWND"]
+
+START_DATE = "2017-01-01"
+END_DATE   = "2024-12-31"
+
+REQUEST_LIMIT = 1000
+MAX_RETRIES = 5
+RETRY_SLEEP = 2      # seconds
+
+GOOD_STATION_IDS = [
+    "GHCND:USW00094846",  # Chicago OHare
+    "GHCND:USW00014819",  # Chicago Midway
+    "GHCND:USW00094870",  # Peoria
+    "GHCND:USW00014922",  # Rockford
+    "GHCND:USC00112005",  # Champaign
+    "GHCND:USC00111577",  # Bloomington
+    "GHCND:USC00110718",  # Decatur
+    "GHCND:USC00113852",  # Springfield
+]
+
+BASE_URL = "https://www.ncdc.noaa.gov/cdo-web/api/v2"
+
+HEADERS = {"token": NOAA_TOKEN}
+
+
+# ---------------------------------------------------------
+# Helper: robust API call with retries
+# ---------------------------------------------------------
+def robust_get(url, params):
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, headers=HEADERS, params=params)
+            if r.status_code == 503:
+                print(f"503 received. Attempt {attempt+1}/{MAX_RETRIES}. Retrying…")
+                time.sleep(RETRY_SLEEP)
+                continue
+            r.raise_for_status()
+            return r
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed: {e}. Retrying… ({attempt+1}/{MAX_RETRIES})")
+            time.sleep(RETRY_SLEEP)
+
+    print("Max retries reached. Skipping this request.")
+    return None
+
+
+# ---------------------------------------------------------
+# Download daily data for a station
+# ---------------------------------------------------------
+def fetch_station_data(station_id):
+    print(f"\n📡 Downloading station {station_id}")
+    data_rows = []
+
+    start_yr = int(START_DATE[:4])
+    end_yr = int(END_DATE[:4])
+
+    for year in range(start_yr, end_yr + 1):
+        print(f"  Year {year}...")
+        year_start = f"{year}-01-01"
+        year_end = f"{year}-12-31"
+
+        if year == start_yr:
+            year_start = START_DATE
+        if year == end_yr:
+            year_end = END_DATE
+
+        # NOAA will return 503 if we include 5 datatypes in one query
+        # → So download each datatype separately
+        for dt in DATATYPES:
+            offset = 1
+
+            while True:
+                params = {
+                    "datasetid": DATASET_ID,
+                    "stationid": station_id,
+                    "startdate": year_start,
+                    "enddate": year_end,
+                    "datatypeid": dt,         # one datatype only
+                    "limit": REQUEST_LIMIT,
+                    "offset": offset,
+                    "units": "standard"
+                }
+
+                r = robust_get(f"{BASE_URL}/data", params)
+                if r is None:
+                    break  # skip this datatype-year
+
+                if r.status_code == 204:
+                    break
+
+                js = r.json()
+                results = js.get("results", [])
+                if not results:
+                    break
+
+                data_rows.extend(results)
+                offset += REQUEST_LIMIT
+                time.sleep(0.3)
+
+    if not data_rows:
+        print(f"  ❌ No data returned for station {station_id}")
+        return pd.DataFrame()
+
+    return pd.DataFrame(data_rows)
+
+
+# ---------------------------------------------------------
+# Pivot station long → wide
+# ---------------------------------------------------------
+def pivot_station(df_station):
+    if df_station.empty:
+        return df_station
+
+    df_station["date"] = pd.to_datetime(df_station["date"]).dt.date
+    df_p = df_station.pivot_table(
+        index=["station", "date"],
+        columns="datatype",
+        values="value",
+        aggfunc="first"
+    ).reset_index()
+
+    df_p.columns.name = None
+
+    for dt in DATATYPES:
+        if dt not in df_p.columns:
+            df_p[dt] = pd.NA
+
+    return df_p
+
+
+# ---------------------------------------------------------
+# Main script
+# ---------------------------------------------------------
+def main():
+    if NOAA_TOKEN == "PUT_YOUR_TOKEN_HERE":
+        raise ValueError("Paste your NOAA API token!")
+
+    Path("data/raw").mkdir(parents=True, exist_ok=True)
+    Path("data/processed").mkdir(parents=True, exist_ok=True)
+
+    station_dfs = []
+
+    for stid in GOOD_STATION_IDS:
+        df_raw = fetch_station_data(stid)
+        if df_raw.empty:
+            continue
+        df_pivot = pivot_station(df_raw)
+        station_dfs.append(df_pivot)
+
+    if not station_dfs:
+        print("❌ No station data downloaded!")
+        return
+
+    daily = pd.concat(station_dfs, ignore_index=True)
+    print("\n✅ Combined daily:", daily.shape)
+
+    daily.to_csv("data/raw/noaa_il_daily_raw.csv", index=False)
+    print("📁 Saved: data/raw/noaa_il_daily_raw.csv")
+
+    # ---------------- weekly aggregation ----------------
+    daily["date"] = pd.to_datetime(daily["date"])
+    daily["year"] = daily["date"].dt.year
+    daily["week"] = daily["date"].dt.isocalendar().week.astype(int)
+
+    for dt in DATATYPES:
+        daily[dt] = pd.to_numeric(daily[dt], errors="coerce")
+
+    weekly = (
+        daily.groupby(["year", "week"])[DATATYPES]
+        .mean()
+        .reset_index()
+        .sort_values(["year", "week"])
+    )
+
+    weekly.to_csv("data/processed/noaa_il_weekly_agg.csv", index=False)
+    print("📁 Saved: data/processed/noaa_il_weekly_agg.csv")
+
+    print("\n🎉 NOAA data download complete. Fully robust, no more crashes.")
+
+
+if __name__ == "__main__":
+    main()
