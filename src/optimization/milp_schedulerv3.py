@@ -15,12 +15,18 @@ def _compute_harvest_weather_factor(row: pd.Series) -> float:
     """
     Heuristic factor (0.3–1.0) that scales harvest capacity based on weather.
 
-    Uses:
-      - weekly rainfall (prcp_week_in)
-      - TAVG, TMAX, TMIN
-      - AWND (avg wind)
+    Uses (if available) the following columns on the row:
+      - prcp_week_in  (weekly rainfall, inches)
+      - TAVG          (avg temperature)
+      - TMAX, TMIN    (max / min temperature)
+      - AWND          (avg wind speed)
 
     Heavy rain / cool temps / low drying / low wind => slower harvest.
+
+    Returns
+    -------
+    float
+        Factor in [0.3, 1.0].
     """
     factor = 1.0
 
@@ -57,7 +63,7 @@ def _compute_harvest_weather_factor(row: pd.Series) -> float:
 
 
 # -------------------------------------------------------------------
-# Main MILP: V3
+# Main MILP: V3 with acreage-scaled labor
 # -------------------------------------------------------------------
 def build_and_solve_schedule_v3(
     fields_path: str = "data/processed/illinois_corn_fields_clean.csv",
@@ -75,6 +81,8 @@ def build_and_solve_schedule_v3(
     late_buffer_weeks: int = 3,
     early_penalty_weight: float = 10.0,
     late_penalty_weight: float = 5.0,
+    # reference statewide corn acres (for scaling labor)
+    statewide_corn_acres: float = 12_000_000.0,
     time_limit: Optional[int] = 60,
 ) -> pd.DataFrame:
     """
@@ -82,15 +90,34 @@ def build_and_solve_schedule_v3(
 
       1. Weather-dependent harvest capacity (NOAA-based slowdown).
       2. Grain moisture penalties (harvesting too early or too late).
-      3. Labor capacity constraints.
+      3. Labor capacity constraints *scaled* from statewide Illinois labor
+         down to the synthetic farm based on acreage ratio.
 
     Objective:
         minimize makespan
         + early_penalty_weight * sum(early_penalty_f)
         + late_penalty_weight  * sum(late_penalty_f)
 
-    Returns:
-        schedule_df with columns:
+    Parameters
+    ----------
+    fields_path : str
+        Clean fields CSV with at least [field_id, acres].
+    weekly_master_path : str
+        Master weekly table with at least:
+        [year, week, capacity_factor, labor_hours,
+         is_plant_window, is_harvest_window]
+        May have multiple rows per (year, week) for different regions;
+        we aggregate to a single state-level row per week.
+    target_year : int
+        Year to optimize.
+    statewide_corn_acres : float
+        Reference total corn acres in Illinois; used to compute
+        labor_scale = synthetic_acres / statewide_corn_acres.
+
+    Returns
+    -------
+    schedule_df : pd.DataFrame
+        Columns:
         field_id, plant_week, harvest_week,
         plant_week_continuous, harvest_week_continuous,
         early_penalty, late_penalty, status, objective_makespan
@@ -110,54 +137,105 @@ def build_and_solve_schedule_v3(
     fields_df = pd.read_csv(fields_path)
     weekly_master = pd.read_csv(weekly_master_path)
 
+    # Filter to target year
     wm_year = weekly_master[weekly_master["year"] == target_year].copy()
     if wm_year.empty:
-        raise ValueError(f"No rows in master_weekly_table for year={target_year}")
+        raise ValueError(f"No rows in weekly master for year={target_year}")
 
     wm_year["week"] = wm_year["week"].astype(int)
-    wm_year = wm_year.sort_values("week").reset_index(drop=True)
 
-    required_cols = [
-        "week",
-        "capacity_factor",
-        "labor_hours",
-        "is_plant_window",
-        "is_harvest_window",
+    # ------------------------------------------------------------------
+    # 1a. Aggregate to one state-level row per week (avoid region mismatch)
+    # ------------------------------------------------------------------
+    agg_spec = {
+        "capacity_factor": "mean",   # average capacity factor across regions
+        "labor_hours": "sum",        # total statewide labor hours
+        "is_plant_window": "max",    # if ANY region can plant, week is plantable
+        "is_harvest_window": "max",  # if ANY region can harvest, week is harvestable
+    }
+
+    # Optional weather columns (if present)
+    for col in ["prcp_week_in", "TAVG", "TMAX", "TMIN", "AWND"]:
+        if col in wm_year.columns:
+            agg_spec[col] = "mean"
+
+    missing_for_agg = [
+        c
+        for c in ["capacity_factor", "labor_hours", "is_plant_window", "is_harvest_window"]
+        if c not in wm_year.columns
     ]
-    missing = [c for c in required_cols if c not in wm_year.columns]
-    if missing:
-        raise ValueError(f"Missing required columns in weekly master: {missing}")
+    if missing_for_agg:
+        raise ValueError(f"Missing required columns in weekly master: {missing_for_agg}")
 
-    wm_year["is_plant_window"] = wm_year["is_plant_window"].astype(bool)
-    wm_year["is_harvest_window"] = wm_year["is_harvest_window"].astype(bool)
+    wm_year = (
+        wm_year
+        .groupby("week", as_index=False)[list(agg_spec.keys())]
+        .agg(agg_spec)
+        .sort_values("week")
+        .reset_index(drop=True)
+    )
 
-    # ------------------------------------------------------------------
-    # 1a. Trim horizon to relevant weeks
-    # ------------------------------------------------------------------
-    plant_weeks_all = wm_year.loc[wm_year["is_plant_window"], "week"].unique()
-    harvest_weeks_all = wm_year.loc[wm_year["is_harvest_window"], "week"].unique()
-
-    if len(plant_weeks_all) == 0:
-        raise ValueError("No planting weeks (is_plant_window == True) for this year.")
-    if len(harvest_weeks_all) == 0:
-        raise ValueError("No harvest weeks (is_harvest_window == True) for this year.")
-
-    w_min = min(plant_weeks_all.min(), harvest_weeks_all.min())
-    w_max = max(plant_weeks_all.max(), harvest_weeks_all.max())
-
-    # small buffer on each side
-    w_min_buffer = max(1, w_min - 1)
-    w_max_buffer = min(52, w_max + 1)
-
-    wm_year = wm_year[
-        (wm_year["week"] >= w_min_buffer) & (wm_year["week"] <= w_max_buffer)
-    ].copy()
-    wm_year = wm_year.sort_values("week").reset_index(drop=True)
-
+    # Now we have exactly one row per week
     weeks = wm_year["week"].unique().tolist()
 
+    # ------------------------------------------------------------------
+    # 1b. Fields & acreage + labor scaling factor
+    # ------------------------------------------------------------------
+    if "field_id" not in fields_df.columns or "acres" not in fields_df.columns:
+        raise ValueError("fields_path must contain 'field_id' and 'acres' columns.")
+
+    fields = fields_df["field_id"].tolist()
+    area = dict(zip(fields_df["field_id"], fields_df["acres"]))
+
+    synthetic_acres = float(sum(area.values()))
+    if statewide_corn_acres <= 0:
+        raise ValueError("statewide_corn_acres must be positive.")
+
+    labor_scale = synthetic_acres / statewide_corn_acres
+    print(
+        f"[INFO] Synthetic acres = {synthetic_acres:.1f}, "
+        f"statewide reference = {statewide_corn_acres:.1f}, "
+        f"labor scale = {labor_scale:.6f}"
+    )
+
+    # Ensure numeric
+    wm_year["capacity_factor"] = pd.to_numeric(
+        wm_year["capacity_factor"], errors="coerce"
+    )
+    wm_year["labor_hours"] = pd.to_numeric(
+        wm_year["labor_hours"], errors="coerce"
+    )
+
+    if wm_year["labor_hours"].isna().any():
+        wm_year["labor_hours"] = wm_year["labor_hours"].fillna(
+            wm_year["labor_hours"].max()
+        )
+
+    # Lookups
+    cap_factor = {
+        int(row["week"]): float(row["capacity_factor"])
+        for _, row in wm_year.iterrows()
+    }
+
+    # Scale statewide labor down to synthetic farm
+    labor_hours = {
+        int(row["week"]): float(row["labor_hours"]) * labor_scale
+        for _, row in wm_year.iterrows()
+    }
+
+    # Weather-dependent harvest slowdown factor
+    wm_year["harvest_weather_factor"] = wm_year.apply(
+        _compute_harvest_weather_factor, axis=1
+    )
+    harvest_weather_factor = {
+        int(row["week"]): float(row["harvest_weather_factor"])
+        for _, row in wm_year.iterrows()
+    }
+
+    # Plant / harvest windows
     is_plant_window = {
-        int(row["week"]): bool(row["is_plant_window"]) for _, row in wm_year.iterrows()
+        int(row["week"]): bool(row["is_plant_window"])
+        for _, row in wm_year.iterrows()
     }
     is_harvest_window = {
         int(row["week"]): bool(row["is_harvest_window"])
@@ -168,47 +246,16 @@ def build_and_solve_schedule_v3(
     harvest_weeks = [w for w in weeks if is_harvest_window[w]]
 
     if not plant_weeks:
-        raise ValueError("No planting weeks after trimming.")
+        raise ValueError("No planting weeks after aggregation.")
     if not harvest_weeks:
-        raise ValueError("No harvest weeks after trimming.")
-
-    # ------------------------------------------------------------------
-    # 1b. Sets & parameters
-    # ------------------------------------------------------------------
-    fields = fields_df["field_id"].tolist()
-    area = dict(zip(fields_df["field_id"], fields_df["acres"]))
-
-    wm_year["capacity_factor"] = pd.to_numeric(
-        wm_year["capacity_factor"], errors="coerce"
-    )
-    wm_year["labor_hours"] = pd.to_numeric(wm_year["labor_hours"], errors="coerce")
-
-    if wm_year["labor_hours"].isna().any():
-        # conservatively use max labor hours so NaNs are never binding
-        wm_year["labor_hours"] = wm_year["labor_hours"].fillna(
-            wm_year["labor_hours"].max()
-        )
-
-    cap_factor = {
-        int(row["week"]): float(row["capacity_factor"]) for _, row in wm_year.iterrows()
-    }
-    labor_hours = {
-        int(row["week"]): float(row["labor_hours"]) for _, row in wm_year.iterrows()
-    }
-
-    # weather-dependent harvest slowdown factor
-    wm_year["harvest_weather_factor"] = wm_year.apply(
-        _compute_harvest_weather_factor, axis=1
-    )
-    harvest_weather_factor = {
-        int(row["week"]): float(row["harvest_weather_factor"])
-        for _, row in wm_year.iterrows()
-    }
+        raise ValueError("No harvest weeks after aggregation.")
 
     # ------------------------------------------------------------------
     # 2. Weekly capacities (equipment × weather)
     # ------------------------------------------------------------------
-    plant_capacity = {w: base_planter_capacity * cap_factor[w] for w in weeks}
+    plant_capacity = {
+        w: base_planter_capacity * cap_factor[w] for w in weeks
+    }
     harvest_capacity = {
         w: base_harvester_capacity * cap_factor[w] * harvest_weather_factor[w]
         for w in weeks
@@ -252,11 +299,13 @@ def build_and_solve_schedule_v3(
     # 4.2 Define plant_week_var and harvest_week_var (weighted sums)
     for f in fields:
         m.addConstr(
-            plant_week_var[f] == gp.quicksum(w * Plant[f, w] for w in plant_weeks),
+            plant_week_var[f]
+            == gp.quicksum(w * Plant[f, w] for w in plant_weeks),
             name=f"DefPlantWeek_{f}",
         )
         m.addConstr(
-            harvest_week_var[f] == gp.quicksum(w * Harvest[f, w] for w in harvest_weeks),
+            harvest_week_var[f]
+            == gp.quicksum(w * Harvest[f, w] for w in harvest_weeks),
             name=f"DefHarvestWeek_{f}",
         )
 
@@ -269,6 +318,7 @@ def build_and_solve_schedule_v3(
 
     # 4.4 Weekly equipment & labor capacity
     for w in weeks:
+        # Machinery capacity
         plant_expr = gp.quicksum(
             area[f] * Plant[f, w] for f in fields if w in plant_weeks
         )
@@ -276,7 +326,6 @@ def build_and_solve_schedule_v3(
             area[f] * Harvest[f, w] for f in fields if w in harvest_weeks
         )
 
-        # machinery capacity
         m.addConstr(
             plant_expr <= plant_capacity[w],
             name=f"PlantCap_week{w}",
@@ -286,7 +335,7 @@ def build_and_solve_schedule_v3(
             name=f"HarvestCap_week{w}",
         )
 
-        # labor capacity
+        # Labor capacity
         plant_labor = gp.quicksum(
             area[f] * labor_plant_per_acre * Plant[f, w]
             for f in fields
@@ -312,12 +361,10 @@ def build_and_solve_schedule_v3(
         )
 
     # 4.6 Grain moisture penalties (early & late)
-    # maturity_week ≈ plant_week + phys_maturity_lag_weeks
     for f in fields:
         maturity_expr = plant_week_var[f] + phys_maturity_lag_weeks
 
         # Early penalty: harvest before maturity
-        # early_penalty[f] >= maturity_week - harvest_week
         m.addConstr(
             early_penalty[f] >= maturity_expr - harvest_week_var[f],
             name=f"EarlyPenaltyDef_{f}",
@@ -328,7 +375,6 @@ def build_and_solve_schedule_v3(
         )
 
         # Late penalty: harvest after maturity + buffer
-        # late_penalty[f] >= harvest_week - (maturity_week + late_buffer)
         m.addConstr(
             late_penalty[f]
             >= harvest_week_var[f] - (maturity_expr + late_buffer_weeks),
@@ -419,6 +465,7 @@ def build_and_solve_schedule_v3(
 
     sol_rows = []
     for f in fields:
+        # chosen discrete weeks
         p_week = None
         h_week = None
 
